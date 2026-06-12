@@ -151,6 +151,7 @@ async function processVoiceoverJob(job) {
       stage: 'creating bunny video',
       transcript: result.transcript,
       mode: result.mode,
+      glossaryMatches: result.glossaryMatches,
     });
 
     const bunnyVideo = await bunnyCreateVideo(job.title);
@@ -199,10 +200,11 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   }
 
   const videoDurationSeconds = await getMediaDurationSeconds(inputVideo);
+  const glossaryMatches = [];
   const phrases = stretchPhraseTimelineToVideo(
     groupWordsIntoPhrases(detailedTranscript.words),
     videoDurationSeconds,
-  ).map((phrase) => correctPhraseWithGlossary(phrase, glossary));
+  ).map((phrase) => correctPhraseWithGlossary(phrase, glossary, glossaryMatches));
 
   if (phrases.length > 0) {
     await synthesizePhraseClips(phrases, workDir, language, voice, rate);
@@ -212,8 +214,10 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
     await padAudioToDuration(ttsPath, videoDurationSeconds, mixedAudioPath);
   }
 
-  await execFileAsync('ffmpeg', [
+  const videoFilters = buildVideoFilters(await getVideoRotationDegrees(inputVideo));
+  const renderArgs = [
     '-y',
+    '-noautorotate',
     '-i',
     inputVideo,
     '-i',
@@ -226,6 +230,13 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
     '20',
     '-pix_fmt',
     'yuv420p',
+  ];
+
+  if (videoFilters) {
+    renderArgs.push('-vf', videoFilters);
+  }
+
+  renderArgs.push(
     '-c:a',
     'aac',
     '-b:a',
@@ -241,12 +252,15 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
     '-movflags',
     '+faststart',
     outputVideo,
-  ]);
+  );
+
+  await execFileAsync('ffmpeg', renderArgs);
 
   return {
     outputVideo,
     transcript,
     mode: phrases.length > 0 ? 'timestamped' : 'single-track-fallback',
+    glossaryMatches,
   };
 }
 
@@ -433,6 +447,46 @@ async function getMediaDurationSeconds(filePath) {
   return duration;
 }
 
+async function getVideoRotationDegrees(filePath) {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v',
+      'error',
+      '-select_streams',
+      'v:0',
+      '-show_entries',
+      'stream_tags=rotate:stream_side_data=rotation',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
+      filePath,
+    ]);
+
+    const values = stdout
+      .split(/\s+/)
+      .map((value) => Number.parseFloat(value))
+      .filter((value) => Number.isFinite(value));
+    const rotation = values.find((value) => Math.abs(value) > 0) || 0;
+    return ((Math.round(rotation) % 360) + 360) % 360;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+function buildVideoFilters(rotationDegrees) {
+  const filters = [];
+
+  if (rotationDegrees === 90) {
+    filters.push('transpose=1');
+  } else if (rotationDegrees === 270) {
+    filters.push('transpose=2');
+  } else if (rotationDegrees === 180) {
+    filters.push('hflip,vflip');
+  }
+
+  filters.push('scale=trunc(iw/2)*2:trunc(ih/2)*2', 'setsar=1');
+  return filters.join(',');
+}
+
 function normalizeAzureWord(word) {
   const text = word.Word || word.word || '';
   const offset = Number(word.Offset ?? word.offset);
@@ -549,7 +603,7 @@ function parseGlossary(text) {
     .filter((item) => item.normalized);
 }
 
-function correctPhraseWithGlossary(phrase, glossary) {
+function correctPhraseWithGlossary(phrase, glossary, matches = []) {
   if (!glossary.length || !phrase.text) {
     return phrase;
   }
@@ -570,6 +624,13 @@ function correctPhraseWithGlossary(phrase, glossary) {
   if (!best || best.score < 0.72) {
     return phrase;
   }
+
+  matches.push({
+    original: phrase.text,
+    corrected: best.item.label,
+    score: Number(best.score.toFixed(3)),
+    startSeconds: Number(phrase.startSeconds.toFixed(2)),
+  });
 
   return {
     ...phrase,
@@ -690,6 +751,7 @@ function publicJob(job) {
     availableResolutions: job.availableResolutions || '',
     transcript: job.transcript || '',
     mode: job.mode || '',
+    glossaryMatches: job.glossaryMatches || [],
     error: job.error || '',
   };
 }
