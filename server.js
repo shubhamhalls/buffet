@@ -17,6 +17,7 @@ const {
   AZURE_SPEECH_REGION,
   PROCESSOR_TOKEN = '',
   PORT = '3000',
+  DEFAULT_SPEECH_RATE = '-25%',
 } = process.env;
 
 app.get('/health', (_req, res) => {
