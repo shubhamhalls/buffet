@@ -15,9 +15,9 @@ const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 300 * 1024 * 1024
 const {
   AZURE_SPEECH_KEY,
   AZURE_SPEECH_REGION,
+  DEFAULT_SPEECH_RATE = '-25%',
   PROCESSOR_TOKEN = '',
   PORT = '3000',
-  DEFAULT_SPEECH_RATE = '-25%',
 } = process.env;
 
 app.get('/health', (_req, res) => {
@@ -43,8 +43,11 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
     return;
   }
 
-  const language = req.body.language || 'en-US';
-  const voice = req.body.voice || 'en-US-JennyNeural';
+  const language = req.body.language || 'en-IN';
+  const voice = req.body.voice || 'en-IN-NeerjaNeural';
+  const rate = req.body.rate || DEFAULT_SPEECH_RATE;
+  const wordPauseMs = Number.parseInt(req.body.wordPauseMs || '0', 10) || 0;
+
   const workDir = path.join(os.tmpdir(), `voiceover-${crypto.randomBytes(6).toString('hex')}`);
   await fs.mkdir(workDir, { recursive: true });
 
@@ -73,7 +76,7 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
       throw new Error('Azure returned an empty transcript.');
     }
 
-    await synthesize(transcript, ttsPath, language, voice);
+    await synthesize(transcript, ttsPath, language, voice, rate, wordPauseMs);
 
     await execFileAsync('ffmpeg', [
       '-y',
@@ -93,6 +96,7 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('X-Voiceover-Transcript', encodeURIComponent(transcript));
+
     createReadStream(outputVideo)
       .on('close', () => cleanup([inputVideo, workDir]))
       .pipe(res);
@@ -105,6 +109,7 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
 async function transcribe(wavPath, language) {
   const url = `https://${AZURE_SPEECH_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${encodeURIComponent(language)}`;
   const audio = await fs.readFile(wavPath);
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -128,9 +133,11 @@ async function transcribe(wavPath, language) {
   return payload.DisplayText || '';
 }
 
-async function synthesize(text, outputPath, language, voice) {
+async function synthesize(text, outputPath, language, voice, rate, wordPauseMs) {
   const url = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
-  const ssml = `<speak version="1.0" xml:lang="${escapeXml(language)}"><voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}">${escapeXml(text)}</voice></speak>`;
+  const body = ssmlTextWithWordPauses(text, wordPauseMs);
+  const ssml = `<speak version="1.0" xml:lang="${escapeXml(language)}"><voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}"><prosody rate="${escapeXml(rate)}">${body}</prosody></voice></speak>`;
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -147,6 +154,21 @@ async function synthesize(text, outputPath, language, voice) {
   }
 
   await fs.writeFile(outputPath, Buffer.from(await response.arrayBuffer()));
+}
+
+function ssmlTextWithWordPauses(text, pauseMs) {
+  if (!pauseMs || pauseMs <= 0) {
+    return escapeXml(text);
+  }
+
+  const safePauseMs = Math.max(0, Math.min(5000, pauseMs));
+
+  return String(text)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(escapeXml)
+    .join(`<break time="${safePauseMs}ms"/>`);
 }
 
 function escapeXml(value) {
