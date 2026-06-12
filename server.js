@@ -153,6 +153,13 @@ async function processVoiceoverJob(job) {
       mode: result.mode,
       glossaryMatches: result.glossaryMatches,
     });
+    console.log(JSON.stringify({
+      event: 'glossary_matches',
+      jobId: job.id,
+      originalName: job.originalName,
+      count: result.glossaryMatches.length,
+      matches: result.glossaryMatches,
+    }));
 
     const bunnyVideo = await bunnyCreateVideo(job.title);
     const bunnyVideoId = bunnyVideo.guid || bunnyVideo.videoId || bunnyVideo.id;
