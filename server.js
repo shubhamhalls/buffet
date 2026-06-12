@@ -49,13 +49,14 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
   const voice = req.body.voice || 'en-IN-NeerjaNeural';
   const rate = req.body.rate || DEFAULT_SPEECH_RATE;
   const wordPauseMs = Number.parseInt(req.body.wordPauseMs || '0', 10) || 0;
+  const glossary = parseGlossary(req.body.glossary || '');
   const workDir = path.join(os.tmpdir(), `voiceover-${crypto.randomBytes(6).toString('hex')}`);
   await fs.mkdir(workDir, { recursive: true });
 
   const inputVideo = req.file.path;
 
   try {
-    const result = await renderVoiceoverVideo(inputVideo, workDir, { language, voice, rate, wordPauseMs });
+    const result = await renderVoiceoverVideo(inputVideo, workDir, { language, voice, rate, wordPauseMs, glossary });
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('X-Voiceover-Transcript', encodeURIComponent(result.transcript));
@@ -98,6 +99,7 @@ app.post('/voiceover-jobs', upload.single('video'), async (req, res) => {
     voice: req.body.voice || 'en-IN-NeerjaNeural',
     rate: req.body.rate || DEFAULT_SPEECH_RATE,
     wordPauseMs: Number.parseInt(req.body.wordPauseMs || '0', 10) || 0,
+    glossary: parseGlossary(req.body.glossary || ''),
     inputVideo: req.file.path,
   };
 
@@ -170,6 +172,7 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   const voice = options.voice || 'en-IN-NeerjaNeural';
   const rate = options.rate || DEFAULT_SPEECH_RATE;
   const wordPauseMs = Number.parseInt(String(options.wordPauseMs || '0'), 10) || 0;
+  const glossary = Array.isArray(options.glossary) ? options.glossary : [];
   const wavPath = path.join(workDir, 'original.wav');
   const ttsPath = path.join(workDir, 'female-voice.mp3');
   const mixedAudioPath = path.join(workDir, 'timestamped-voice.wav');
@@ -199,7 +202,7 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   const phrases = stretchPhraseTimelineToVideo(
     groupWordsIntoPhrases(detailedTranscript.words),
     videoDurationSeconds,
-  );
+  ).map((phrase) => correctPhraseWithGlossary(phrase, glossary));
 
   if (phrases.length > 0) {
     await synthesizePhraseClips(phrases, workDir, language, voice, rate);
@@ -530,6 +533,104 @@ function stretchPhraseTimelineToVideo(phrases, videoDurationSeconds) {
   });
 
   return withPhraseTargetDurations(stretched);
+}
+
+function parseGlossary(text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .slice(0, 300)
+    .map((label) => ({
+      label,
+      normalized: normalizeTextForMatch(label),
+      words: normalizeTextForMatch(label).split(' ').filter(Boolean),
+    }))
+    .filter((item) => item.normalized);
+}
+
+function correctPhraseWithGlossary(phrase, glossary) {
+  if (!glossary.length || !phrase.text) {
+    return phrase;
+  }
+
+  const normalizedPhrase = normalizeTextForMatch(phrase.text);
+  if (!normalizedPhrase) {
+    return phrase;
+  }
+
+  let best = null;
+  for (const item of glossary) {
+    const score = glossaryScore(normalizedPhrase, item);
+    if (!best || score > best.score) {
+      best = { item, score };
+    }
+  }
+
+  if (!best || best.score < 0.72) {
+    return phrase;
+  }
+
+  return {
+    ...phrase,
+    originalText: phrase.text,
+    text: best.item.label,
+  };
+}
+
+function glossaryScore(normalizedPhrase, item) {
+  if (normalizedPhrase === item.normalized) {
+    return 1;
+  }
+
+  if (normalizedPhrase.includes(item.normalized) || item.normalized.includes(normalizedPhrase)) {
+    return 0.9;
+  }
+
+  const phraseWords = new Set(normalizedPhrase.split(' ').filter(Boolean));
+  const matchingWords = item.words.filter((word) => phraseWords.has(word)).length;
+  const wordScore = item.words.length ? matchingWords / item.words.length : 0;
+  const editScore = similarity(normalizedPhrase, item.normalized);
+
+  return Math.max(wordScore * 0.88, editScore);
+}
+
+function normalizeTextForMatch(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function similarity(a, b) {
+  if (!a || !b) {
+    return 0;
+  }
+
+  const distance = levenshteinDistance(a, b);
+  return 1 - distance / Math.max(a.length, b.length);
+}
+
+function levenshteinDistance(a, b) {
+  const previous = Array.from({ length: b.length + 1 }, (_value, index) => index);
+  const current = new Array(b.length + 1);
+
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost,
+      );
+    }
+
+    previous.splice(0, previous.length, ...current);
+  }
+
+  return previous[b.length];
 }
 
 function buildAtempoFilter(tempo) {
