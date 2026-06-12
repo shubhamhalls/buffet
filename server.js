@@ -95,7 +95,13 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
       '-i',
       mixedAudioPath,
       '-c:v',
-      'copy',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '20',
+      '-pix_fmt',
+      'yuv420p',
       '-c:a',
       'aac',
       '-b:a',
@@ -106,6 +112,10 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
       '1:a:0',
       '-t',
       String(videoDurationSeconds),
+      '-metadata:s:v:0',
+      'rotate=0',
+      '-movflags',
+      '+faststart',
       outputVideo,
     ]);
 
@@ -200,10 +210,33 @@ async function synthesize(text, outputPath, language, voice, rate, wordPauseMs) 
 
 async function synthesizePhraseClips(phrases, workDir, language, voice, rate) {
   for (const [index, phrase] of phrases.entries()) {
-    const clipPath = path.join(workDir, `phrase-${String(index).padStart(3, '0')}.mp3`);
-    phrase.clipPath = clipPath;
-    await synthesize(phrase.text, clipPath, language, voice, rate, 0);
+    const rawClipPath = path.join(workDir, `phrase-${String(index).padStart(3, '0')}-raw.mp3`);
+    const fittedClipPath = path.join(workDir, `phrase-${String(index).padStart(3, '0')}.mp3`);
+    phrase.clipPath = fittedClipPath;
+    await synthesize(phrase.text, rawClipPath, language, voice, rate, 0);
+    await fitAudioClipToDuration(rawClipPath, fittedClipPath, phrase.targetDurationSeconds);
   }
+}
+
+async function fitAudioClipToDuration(inputPath, outputPath, targetDurationSeconds) {
+  const clipDurationSeconds = await getMediaDurationSeconds(inputPath);
+  const targetDuration = Math.max(0.4, targetDurationSeconds || clipDurationSeconds);
+  const tempo = clipDurationSeconds / targetDuration;
+  const atempoFilter = buildAtempoFilter(tempo);
+  const filters = [
+    ...(atempoFilter ? [atempoFilter] : []),
+    'apad',
+    `atrim=0:${targetDuration}`,
+  ];
+
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-i',
+    inputPath,
+    '-filter:a',
+    filters.join(','),
+    outputPath,
+  ]);
 }
 
 async function mixPhraseClips(phrases, durationSeconds, outputPath) {
@@ -324,7 +357,7 @@ function groupWordsIntoPhrases(words) {
     phrases.push(buildPhrase(current));
   }
 
-  return phrases.filter((phrase) => phrase.text);
+  return withPhraseTargetDurations(phrases.filter((phrase) => phrase.text));
 }
 
 function buildPhrase(words) {
@@ -336,6 +369,44 @@ function buildPhrase(words) {
     startSeconds: first.startSeconds,
     endSeconds: last.startSeconds + last.durationSeconds,
   };
+}
+
+function withPhraseTargetDurations(phrases) {
+  return phrases.map((phrase, index) => {
+    const nextPhrase = phrases[index + 1];
+    const originalDuration = Math.max(0.4, phrase.endSeconds - phrase.startSeconds);
+    const availableWindow = nextPhrase
+      ? Math.max(originalDuration, nextPhrase.startSeconds - phrase.startSeconds - 0.15)
+      : originalDuration;
+    const targetDurationSeconds = Math.min(
+      Math.max(originalDuration, Math.min(availableWindow, 3.5)),
+      5,
+    );
+
+    return { ...phrase, targetDurationSeconds };
+  });
+}
+
+function buildAtempoFilter(tempo) {
+  if (!Number.isFinite(tempo) || tempo <= 0 || Math.abs(tempo - 1) < 0.03) {
+    return '';
+  }
+
+  const parts = [];
+  let remaining = tempo;
+
+  while (remaining < 0.5) {
+    parts.push('atempo=0.5');
+    remaining /= 0.5;
+  }
+
+  while (remaining > 2) {
+    parts.push('atempo=2');
+    remaining /= 2;
+  }
+
+  parts.push(`atempo=${remaining.toFixed(3)}`);
+  return parts.join(',');
 }
 
 function ssmlTextWithWordPauses(text, pauseMs) {
