@@ -78,7 +78,10 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
     }
 
     const videoDurationSeconds = await getMediaDurationSeconds(inputVideo);
-    const phrases = groupWordsIntoPhrases(detailedTranscript.words);
+    const phrases = stretchPhraseTimelineToVideo(
+      groupWordsIntoPhrases(detailedTranscript.words),
+      videoDurationSeconds,
+    );
 
     if (phrases.length > 0) {
       await synthesizePhraseClips(phrases, workDir, language, voice, rate);
@@ -385,6 +388,35 @@ function withPhraseTargetDurations(phrases) {
 
     return { ...phrase, targetDurationSeconds };
   });
+}
+
+function stretchPhraseTimelineToVideo(phrases, videoDurationSeconds) {
+  if (!phrases.length || !Number.isFinite(videoDurationSeconds) || videoDurationSeconds <= 0) {
+    return phrases;
+  }
+
+  const firstStart = phrases[0].startSeconds;
+  const lastEnd = phrases[phrases.length - 1].endSeconds;
+  const spokenSpan = Math.max(0.1, lastEnd - firstStart);
+  const targetEnd = Math.max(firstStart + spokenSpan, videoDurationSeconds - 1);
+
+  if (lastEnd >= videoDurationSeconds * 0.85) {
+    return phrases;
+  }
+
+  const stretch = Math.min(3, (targetEnd - firstStart) / spokenSpan);
+  const stretched = phrases.map((phrase) => {
+    const startSeconds = firstStart + (phrase.startSeconds - firstStart) * stretch;
+    const endSeconds = firstStart + (phrase.endSeconds - firstStart) * stretch;
+
+    return {
+      ...phrase,
+      startSeconds,
+      endSeconds,
+    };
+  });
+
+  return withPhraseTargetDurations(stretched);
 }
 
 function buildAtempoFilter(tempo) {
