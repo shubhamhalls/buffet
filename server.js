@@ -47,13 +47,13 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
   const voice = req.body.voice || 'en-IN-NeerjaNeural';
   const rate = req.body.rate || DEFAULT_SPEECH_RATE;
   const wordPauseMs = Number.parseInt(req.body.wordPauseMs || '0', 10) || 0;
-
   const workDir = path.join(os.tmpdir(), `voiceover-${crypto.randomBytes(6).toString('hex')}`);
   await fs.mkdir(workDir, { recursive: true });
 
   const inputVideo = req.file.path;
   const wavPath = path.join(workDir, 'original.wav');
   const ttsPath = path.join(workDir, 'female-voice.mp3');
+  const mixedAudioPath = path.join(workDir, 'timestamped-voice.wav');
   const outputVideo = path.join(workDir, 'female-voice-video.mp4');
 
   try {
@@ -71,32 +71,47 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
       wavPath,
     ]);
 
-    const transcript = await transcribe(wavPath, language);
+    const detailedTranscript = await transcribeDetailed(wavPath, language);
+    const transcript = detailedTranscript.transcript;
     if (!transcript.trim()) {
       throw new Error('Azure returned an empty transcript.');
     }
 
-    await synthesize(transcript, ttsPath, language, voice, rate, wordPauseMs);
+    const videoDurationSeconds = await getMediaDurationSeconds(inputVideo);
+    const phrases = groupWordsIntoPhrases(detailedTranscript.words);
+
+    if (phrases.length > 0) {
+      await synthesizePhraseClips(phrases, workDir, language, voice, rate);
+      await mixPhraseClips(phrases, videoDurationSeconds, mixedAudioPath);
+    } else {
+      await synthesize(transcript, ttsPath, language, voice, rate, wordPauseMs);
+      await padAudioToDuration(ttsPath, videoDurationSeconds, mixedAudioPath);
+    }
 
     await execFileAsync('ffmpeg', [
       '-y',
       '-i',
       inputVideo,
       '-i',
-      ttsPath,
+      mixedAudioPath,
       '-c:v',
       'copy',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
       '-map',
       '0:v:0',
       '-map',
       '1:a:0',
-      '-shortest',
+      '-t',
+      String(videoDurationSeconds),
       outputVideo,
     ]);
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('X-Voiceover-Transcript', encodeURIComponent(transcript));
-
+    res.setHeader('X-Voiceover-Mode', phrases.length > 0 ? 'timestamped' : 'single-track-fallback');
     createReadStream(outputVideo)
       .on('close', () => cleanup([inputVideo, workDir]))
       .pipe(res);
@@ -109,7 +124,6 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
 async function transcribe(wavPath, language) {
   const url = `https://${AZURE_SPEECH_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${encodeURIComponent(language)}`;
   const audio = await fs.readFile(wavPath);
-
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -133,11 +147,39 @@ async function transcribe(wavPath, language) {
   return payload.DisplayText || '';
 }
 
+async function transcribeDetailed(wavPath, language) {
+  const url = `https://${AZURE_SPEECH_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${encodeURIComponent(language)}&format=detailed`;
+  const audio = await fs.readFile(wavPath);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
+      'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
+      Accept: 'application/json',
+    },
+    body: audio,
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Azure detailed STT failed ${response.status}: ${text}`);
+  }
+
+  const payload = JSON.parse(text);
+  if (payload.RecognitionStatus !== 'Success') {
+    throw new Error(`Azure detailed STT failed: ${text}`);
+  }
+
+  const best = payload.NBest?.[0] || {};
+  const transcript = best.Display || payload.DisplayText || '';
+  const words = Array.isArray(best.Words) ? best.Words.map(normalizeAzureWord).filter(Boolean) : [];
+  return { transcript, words };
+}
+
 async function synthesize(text, outputPath, language, voice, rate, wordPauseMs) {
   const url = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
   const body = ssmlTextWithWordPauses(text, wordPauseMs);
   const ssml = `<speak version="1.0" xml:lang="${escapeXml(language)}"><voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}"><prosody rate="${escapeXml(rate)}">${body}</prosody></voice></speak>`;
-
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -156,13 +198,152 @@ async function synthesize(text, outputPath, language, voice, rate, wordPauseMs) 
   await fs.writeFile(outputPath, Buffer.from(await response.arrayBuffer()));
 }
 
+async function synthesizePhraseClips(phrases, workDir, language, voice, rate) {
+  for (const [index, phrase] of phrases.entries()) {
+    const clipPath = path.join(workDir, `phrase-${String(index).padStart(3, '0')}.mp3`);
+    phrase.clipPath = clipPath;
+    await synthesize(phrase.text, clipPath, language, voice, rate, 0);
+  }
+}
+
+async function mixPhraseClips(phrases, durationSeconds, outputPath) {
+  const args = [
+    '-y',
+    '-f',
+    'lavfi',
+    '-t',
+    String(durationSeconds),
+    '-i',
+    'anullsrc=channel_layout=mono:sample_rate=24000',
+  ];
+
+  for (const phrase of phrases) {
+    args.push('-i', phrase.clipPath);
+  }
+
+  const filters = phrases.map((phrase, index) => {
+    const inputIndex = index + 1;
+    const delayMs = Math.max(0, Math.round(phrase.startSeconds * 1000));
+    return `[${inputIndex}:a]adelay=${delayMs}|${delayMs}[a${inputIndex}]`;
+  });
+
+  const mixedInputs = ['[0:a]', ...phrases.map((_phrase, index) => `[a${index + 1}]`)].join('');
+  filters.push(`${mixedInputs}amix=inputs=${phrases.length + 1}:duration=first:dropout_transition=0:normalize=0[aout]`);
+
+  args.push(
+    '-filter_complex',
+    filters.join(';'),
+    '-map',
+    '[aout]',
+    '-t',
+    String(durationSeconds),
+    outputPath,
+  );
+
+  await execFileAsync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 10 });
+}
+
+async function padAudioToDuration(inputAudioPath, durationSeconds, outputPath) {
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-i',
+    inputAudioPath,
+    '-f',
+    'lavfi',
+    '-t',
+    String(durationSeconds),
+    '-i',
+    'anullsrc=channel_layout=mono:sample_rate=24000',
+    '-filter_complex',
+    `[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,atrim=0:${durationSeconds}[aout]`,
+    '-map',
+    '[aout]',
+    outputPath,
+  ]);
+}
+
+async function getMediaDurationSeconds(filePath) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ]);
+
+  const duration = Number.parseFloat(stdout);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error('Could not read video duration with ffprobe.');
+  }
+
+  return duration;
+}
+
+function normalizeAzureWord(word) {
+  const text = word.Word || word.word || '';
+  const offset = Number(word.Offset ?? word.offset);
+  const duration = Number(word.Duration ?? word.duration);
+
+  if (!text || !Number.isFinite(offset) || !Number.isFinite(duration)) {
+    return null;
+  }
+
+  return {
+    text,
+    startSeconds: offset / 10000000,
+    durationSeconds: duration / 10000000,
+  };
+}
+
+function groupWordsIntoPhrases(words) {
+  if (!Array.isArray(words) || words.length === 0) {
+    return [];
+  }
+
+  const phrases = [];
+  let current = [];
+
+  for (const word of words) {
+    const previous = current[current.length - 1];
+    const currentStart = current[0]?.startSeconds ?? word.startSeconds;
+    const previousEnd = previous ? previous.startSeconds + previous.durationSeconds : word.startSeconds;
+    const gap = word.startSeconds - previousEnd;
+    const phraseDuration = word.startSeconds + word.durationSeconds - currentStart;
+
+    if (current.length > 0 && (gap > 0.8 || current.length >= 5 || phraseDuration > 3.5)) {
+      phrases.push(buildPhrase(current));
+      current = [];
+    }
+
+    current.push(word);
+  }
+
+  if (current.length > 0) {
+    phrases.push(buildPhrase(current));
+  }
+
+  return phrases.filter((phrase) => phrase.text);
+}
+
+function buildPhrase(words) {
+  const first = words[0];
+  const last = words[words.length - 1];
+
+  return {
+    text: words.map((word) => word.text).join(' '),
+    startSeconds: first.startSeconds,
+    endSeconds: last.startSeconds + last.durationSeconds,
+  };
+}
+
 function ssmlTextWithWordPauses(text, pauseMs) {
   if (!pauseMs || pauseMs <= 0) {
     return escapeXml(text);
   }
 
   const safePauseMs = Math.max(0, Math.min(5000, pauseMs));
-
   return String(text)
     .trim()
     .split(/\s+/)
