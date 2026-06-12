@@ -18,7 +18,7 @@ const {
   BUNNY_LIBRARY_ID = '',
   BUNNY_API_KEY = '',
   BUNNY_ENABLED_RESOLUTIONS = '360p,480p,720p,1080p',
-  DEFAULT_SPEECH_RATE = '-25%',
+  DEFAULT_SPEECH_RATE = '0%',
   PROCESSOR_TOKEN = '',
   PORT = '3000',
 } = process.env;
@@ -461,7 +461,7 @@ function groupWordsIntoPhrases(words) {
     const gap = word.startSeconds - previousEnd;
     const phraseDuration = word.startSeconds + word.durationSeconds - currentStart;
 
-    if (current.length > 0 && (gap > 0.8 || current.length >= 5 || phraseDuration > 3.5)) {
+    if (current.length > 0 && (gap > 1.6 || current.length >= 10 || phraseDuration > 6)) {
       phrases.push(buildPhrase(current));
       current = [];
     }
@@ -495,8 +495,8 @@ function withPhraseTargetDurations(phrases) {
       ? Math.max(originalDuration, nextPhrase.startSeconds - phrase.startSeconds - 0.15)
       : originalDuration;
     const targetDurationSeconds = Math.min(
-      Math.max(originalDuration, Math.min(availableWindow, 3.5)),
-      5,
+      Math.max(originalDuration, Math.min(availableWindow, 2.5)),
+      3.5,
     );
 
     return { ...phrase, targetDurationSeconds };
