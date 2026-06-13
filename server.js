@@ -50,13 +50,14 @@ app.post('/voiceover', upload.single('video'), async (req, res) => {
   const rate = req.body.rate || DEFAULT_SPEECH_RATE;
   const wordPauseMs = Number.parseInt(req.body.wordPauseMs || '0', 10) || 0;
   const glossary = parseGlossary(req.body.glossary || '');
+  const voiceoverScript = parseVoiceoverScript(req.body.voiceoverScript || '');
   const workDir = path.join(os.tmpdir(), `voiceover-${crypto.randomBytes(6).toString('hex')}`);
   await fs.mkdir(workDir, { recursive: true });
 
   const inputVideo = req.file.path;
 
   try {
-    const result = await renderVoiceoverVideo(inputVideo, workDir, { language, voice, rate, wordPauseMs, glossary });
+    const result = await renderVoiceoverVideo(inputVideo, workDir, { language, voice, rate, wordPauseMs, glossary, voiceoverScript });
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('X-Voiceover-Transcript', encodeURIComponent(result.transcript));
@@ -100,6 +101,7 @@ app.post('/voiceover-jobs', upload.single('video'), async (req, res) => {
     rate: req.body.rate || DEFAULT_SPEECH_RATE,
     wordPauseMs: Number.parseInt(req.body.wordPauseMs || '0', 10) || 0,
     glossary: parseGlossary(req.body.glossary || ''),
+    voiceoverScript: parseVoiceoverScript(req.body.voiceoverScript || ''),
     inputVideo: req.file.path,
   };
 
@@ -181,37 +183,48 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   const rate = options.rate || DEFAULT_SPEECH_RATE;
   const wordPauseMs = Number.parseInt(String(options.wordPauseMs || '0'), 10) || 0;
   const glossary = Array.isArray(options.glossary) ? options.glossary : [];
+  const voiceoverScript = Array.isArray(options.voiceoverScript) ? options.voiceoverScript : [];
   const wavPath = path.join(workDir, 'original.wav');
   const ttsPath = path.join(workDir, 'female-voice.mp3');
   const mixedAudioPath = path.join(workDir, 'timestamped-voice.wav');
   const outputVideo = path.join(workDir, 'female-voice-video.mp4');
-
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-i',
-    inputVideo,
-    '-vn',
-    '-ac',
-    '1',
-    '-ar',
-    '16000',
-    '-f',
-    'wav',
-    wavPath,
-  ]);
-
-  const detailedTranscript = await transcribeDetailed(wavPath, language);
-  const transcript = detailedTranscript.transcript;
-  if (!transcript.trim()) {
-    throw new Error('Azure returned an empty transcript.');
-  }
-
   const videoDurationSeconds = await getMediaDurationSeconds(inputVideo);
-  const glossaryMatches = [];
-  const phrases = stretchPhraseTimelineToVideo(
-    groupWordsIntoPhrases(detailedTranscript.words),
-    videoDurationSeconds,
-  ).map((phrase) => correctPhraseWithGlossary(phrase, glossary, glossaryMatches));
+  let transcript = '';
+  let phrases = [];
+  let glossaryMatches = [];
+  let mode = 'timestamped';
+
+  if (voiceoverScript.length > 0) {
+    transcript = voiceoverScript.join('. ');
+    phrases = buildScriptPhrases(voiceoverScript, videoDurationSeconds);
+    mode = 'scripted';
+  } else {
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-i',
+      inputVideo,
+      '-vn',
+      '-ac',
+      '1',
+      '-ar',
+      '16000',
+      '-f',
+      'wav',
+      wavPath,
+    ]);
+
+    const detailedTranscript = await transcribeDetailed(wavPath, language);
+    transcript = detailedTranscript.transcript;
+    if (!transcript.trim()) {
+      throw new Error('Azure returned an empty transcript.');
+    }
+
+    glossaryMatches = [];
+    phrases = stretchPhraseTimelineToVideo(
+      groupWordsIntoPhrases(detailedTranscript.words),
+      videoDurationSeconds,
+    ).map((phrase) => correctPhraseWithGlossary(phrase, glossary, glossaryMatches));
+  }
 
   if (phrases.length > 0) {
     await synthesizePhraseClips(phrases, workDir, language, voice, rate);
@@ -266,7 +279,7 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   return {
     outputVideo,
     transcript,
-    mode: phrases.length > 0 ? 'timestamped' : 'single-track-fallback',
+    mode: phrases.length > 0 ? mode : 'single-track-fallback',
     glossaryMatches,
   };
 }
@@ -540,6 +553,36 @@ function groupWordsIntoPhrases(words) {
   return withPhraseTargetDurations(phrases.filter((phrase) => phrase.text));
 }
 
+function buildScriptPhrases(lines, videoDurationSeconds) {
+  const phrases = lines
+    .map((text) => String(text).trim())
+    .filter(Boolean)
+    .slice(0, 120);
+
+  if (!phrases.length) {
+    return [];
+  }
+
+  const leadInSeconds = Math.min(2, Math.max(0.5, videoDurationSeconds * 0.04));
+  const usableDuration = Math.max(1, videoDurationSeconds - leadInSeconds - 1);
+  const slotSeconds = usableDuration / phrases.length;
+
+  return phrases.map((text, index) => {
+    const startSeconds = leadInSeconds + (index * slotSeconds);
+    const targetDurationSeconds = Math.min(
+      Math.max(1.2, slotSeconds * 0.72),
+      4,
+    );
+
+    return {
+      text,
+      startSeconds,
+      endSeconds: startSeconds + targetDurationSeconds,
+      targetDurationSeconds,
+    };
+  });
+}
+
 function buildPhrase(words) {
   const first = words[0];
   const last = words[words.length - 1];
@@ -608,6 +651,16 @@ function parseGlossary(text) {
       words: normalizeTextForMatch(label).split(' ').filter(Boolean),
     }))
     .filter((item) => item.normalized);
+}
+
+function parseVoiceoverScript(text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map((line) => line.replace(/^\d+[\).\-\s]+/, '').trim())
+    .filter(Boolean)
+    .slice(0, 120);
 }
 
 function correctPhraseWithGlossary(phrase, glossary, matches = []) {
