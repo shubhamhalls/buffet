@@ -310,22 +310,60 @@ async function synthesize(text, outputPath, language, voice, rate, wordPauseMs) 
   const url = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
   const body = ssmlTextWithWordPauses(text, wordPauseMs);
   const ssml = `<speak version="1.0" xml:lang="${escapeXml(language)}"><voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}"><prosody rate="${escapeXml(rate)}">${body}</prosody></voice></speak>`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
-      'Content-Type': 'application/ssml+xml',
-      'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
-      'User-Agent': 'buffet-video-azure-voiceover',
-    },
-    body: ssml,
-  });
+  const response = await fetchAzureTtsWithRetry(url, ssml);
 
   if (!response.ok) {
     throw new Error(`Azure TTS failed ${response.status}: ${await response.text()}`);
   }
 
   await fs.writeFile(outputPath, Buffer.from(await response.arrayBuffer()));
+}
+
+async function fetchAzureTtsWithRetry(url, ssml) {
+  const maxAttempts = 6;
+  let lastResponse = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
+        'User-Agent': 'buffet-video-azure-voiceover',
+      },
+      body: ssml,
+    });
+
+    if (response.status !== 429 && response.status < 500) {
+      return response;
+    }
+
+    lastResponse = response;
+    if (attempt === maxAttempts) {
+      return response;
+    }
+
+    const retryAfterSeconds = Number.parseInt(response.headers.get('retry-after') || '', 10);
+    const delayMs = Number.isFinite(retryAfterSeconds)
+      ? retryAfterSeconds * 1000
+      : Math.min(30000, 2000 * attempt * attempt);
+
+    console.log(JSON.stringify({
+      event: 'azure_tts_retry',
+      status: response.status,
+      attempt,
+      nextDelayMs: delayMs,
+    }));
+
+    await sleep(delayMs);
+  }
+
+  return lastResponse;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function synthesizePhraseClips(phrases, workDir, language, voice, rate) {
