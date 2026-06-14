@@ -156,11 +156,11 @@ async function processVoiceoverJob(job) {
       glossaryMatches: result.glossaryMatches,
     });
     console.log(JSON.stringify({
-      event: 'glossary_matches',
+      event: 'voiceover_rendered',
       jobId: job.id,
       originalName: job.originalName,
-      count: result.glossaryMatches.length,
-      matches: result.glossaryMatches,
+      mode: result.mode,
+      scriptLineCount: job.voiceoverScript.length,
     }));
 
     const bunnyVideo = await bunnyCreateVideo(job.title);
@@ -193,13 +193,12 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
     throw new Error('Missing voiceover script. Hostinger must send voiceoverScript from buffet-voiceover-script.txt.');
   }
 
-  const transcript = voiceoverScript.join('. ');
-  const phrases = buildScriptPhrases(voiceoverScript, videoDurationSeconds);
+  const transcript = voiceoverScript.map(phraseForTts).join(' ');
   const glossaryMatches = [];
-  const mode = 'scripted';
+  const mode = 'scripted-single-track';
 
-  await synthesizePhraseClips(phrases, workDir, language, voice, rate);
-  await mixPhraseClips(phrases, videoDurationSeconds, mixedAudioPath);
+  await synthesize(transcript, ttsPath, language, voice, rate, wordPauseMs);
+  await padAudioToDuration(ttsPath, videoDurationSeconds, mixedAudioPath);
 
   const videoFilters = buildVideoFilters(await getVideoRotationDegrees(inputVideo));
   const renderArgs = [
@@ -586,6 +585,15 @@ function buildScriptPhrases(lines, videoDurationSeconds) {
       targetDurationSeconds,
     };
   });
+}
+
+function phraseForTts(text) {
+  const phrase = String(text).trim();
+  if (!phrase) {
+    return '';
+  }
+
+  return /[.!?]$/.test(phrase) ? phrase : `${phrase}.`;
 }
 
 function buildPhrase(words) {
