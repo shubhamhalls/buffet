@@ -184,55 +184,22 @@ async function renderVoiceoverVideo(inputVideo, workDir, options) {
   const wordPauseMs = Number.parseInt(String(options.wordPauseMs || '0'), 10) || 0;
   const glossary = Array.isArray(options.glossary) ? options.glossary : [];
   const voiceoverScript = Array.isArray(options.voiceoverScript) ? options.voiceoverScript : [];
-  const wavPath = path.join(workDir, 'original.wav');
   const ttsPath = path.join(workDir, 'female-voice.mp3');
   const mixedAudioPath = path.join(workDir, 'timestamped-voice.wav');
   const outputVideo = path.join(workDir, 'female-voice-video.mp4');
   const videoDurationSeconds = await getMediaDurationSeconds(inputVideo);
-  let transcript = '';
-  let phrases = [];
-  let glossaryMatches = [];
-  let mode = 'timestamped';
 
-  if (voiceoverScript.length > 0) {
-    transcript = voiceoverScript.join('. ');
-    phrases = buildScriptPhrases(voiceoverScript, videoDurationSeconds);
-    mode = 'scripted';
-  } else {
-    await execFileAsync('ffmpeg', [
-      '-y',
-      '-i',
-      inputVideo,
-      '-vn',
-      '-ac',
-      '1',
-      '-ar',
-      '16000',
-      '-f',
-      'wav',
-      wavPath,
-    ]);
-
-    const detailedTranscript = await transcribeDetailed(wavPath, language);
-    transcript = detailedTranscript.transcript;
-    if (!transcript.trim()) {
-      throw new Error('Azure returned an empty transcript.');
-    }
-
-    glossaryMatches = [];
-    phrases = stretchPhraseTimelineToVideo(
-      groupWordsIntoPhrases(detailedTranscript.words),
-      videoDurationSeconds,
-    ).map((phrase) => correctPhraseWithGlossary(phrase, glossary, glossaryMatches));
+  if (voiceoverScript.length === 0) {
+    throw new Error('Missing voiceover script. Hostinger must send voiceoverScript from buffet-voiceover-script.txt.');
   }
 
-  if (phrases.length > 0) {
-    await synthesizePhraseClips(phrases, workDir, language, voice, rate);
-    await mixPhraseClips(phrases, videoDurationSeconds, mixedAudioPath);
-  } else {
-    await synthesize(transcript, ttsPath, language, voice, rate, wordPauseMs);
-    await padAudioToDuration(ttsPath, videoDurationSeconds, mixedAudioPath);
-  }
+  const transcript = voiceoverScript.join('. ');
+  const phrases = buildScriptPhrases(voiceoverScript, videoDurationSeconds);
+  const glossaryMatches = [];
+  const mode = 'scripted';
+
+  await synthesizePhraseClips(phrases, workDir, language, voice, rate);
+  await mixPhraseClips(phrases, videoDurationSeconds, mixedAudioPath);
 
   const videoFilters = buildVideoFilters(await getVideoRotationDegrees(inputVideo));
   const renderArgs = [
